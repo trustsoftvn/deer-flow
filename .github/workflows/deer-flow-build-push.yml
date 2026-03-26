@@ -1,0 +1,187 @@
+name: Build & Push Docker Images
+
+# Triggers:
+#   - Push to main branch (builds + pushes :latest and :sha-<short> tags)
+#   - Push of version tags like v1.2.3 (builds + pushes :<version> tag)
+#   - Pull requests (build only, no push — validates the Dockerfile)
+#   - Manual trigger via workflow_dispatch
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*.*.*'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      push:
+        description: 'Push images to registry'
+        required: false
+        default: 'true'
+        type: choice
+        options: ['true', 'false']
+
+env:
+  # TODO: replace with your registry and org
+  REGISTRY: ghcr.io
+  ORG: ${{ github.repository_owner }}
+
+permissions:
+  contents: read
+  packages: write   # needed to push to ghcr.io
+
+jobs:
+  # ── Determine image tags ────────────────────────────────────────────────────
+  meta:
+    name: Compute image metadata
+    runs-on: ubuntu-latest
+    outputs:
+      backend-tags:  ${{ steps.backend.outputs.tags }}
+      frontend-tags: ${{ steps.frontend.outputs.tags }}
+      labels:        ${{ steps.backend.outputs.labels }}
+      push:          ${{ steps.push.outputs.value }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Decide whether to push
+        id: push
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            echo "value=false" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "value=${{ github.event.inputs.push }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Docker metadata — backend
+        id: backend
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.ORG }}/deer-flow-backend
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+      - name: Docker metadata — frontend
+        id: frontend
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.ORG }}/deer-flow-frontend
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=sha-,format=short
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+
+  # ── Build & push backend image ──────────────────────────────────────────────
+  build-backend:
+    name: Build backend
+    runs-on: ubuntu-latest
+    needs: meta
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU (for multi-arch builds)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: needs.meta.outputs.push == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push backend
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: backend/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ needs.meta.outputs.push == 'true' }}
+          tags: ${{ needs.meta.outputs.backend-tags }}
+          labels: ${{ needs.meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.ORG }}/deer-flow-backend:cache
+          cache-to: |
+            ${{ needs.meta.outputs.push == 'true' && format('type=registry,ref={0}/{1}/deer-flow-backend:cache,mode=max', env.REGISTRY, env.ORG) || 'type=inline' }}
+
+  # ── Build & push frontend image ─────────────────────────────────────────────
+  build-frontend:
+    name: Build frontend
+    runs-on: ubuntu-latest
+    needs: meta
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: needs.meta.outputs.push == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push frontend
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: frontend/Dockerfile
+          target: prod
+          platforms: linux/amd64,linux/arm64
+          push: ${{ needs.meta.outputs.push == 'true' }}
+          tags: ${{ needs.meta.outputs.frontend-tags }}
+          labels: ${{ needs.meta.outputs.labels }}
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.ORG }}/deer-flow-frontend:cache
+          cache-to: |
+            ${{ needs.meta.outputs.push == 'true' && format('type=registry,ref={0}/{1}/deer-flow-frontend:cache,mode=max', env.REGISTRY, env.ORG) || 'type=inline' }}
+          build-args: |
+            PNPM_STORE_PATH=/root/.local/share/pnpm/store
+
+  # ── Update K8s image tags on main ───────────────────────────────────────────
+  # Optional: auto-update kustomization.yaml with the new sha tag and
+  # open a PR (or push directly) to trigger a GitOps deployment.
+  # Uncomment and customize if you use ArgoCD / Flux.
+  #
+  # update-k8s-tags:
+  #   name: Update K8s image tags
+  #   runs-on: ubuntu-latest
+  #   needs: [meta, build-backend, build-frontend]
+  #   if: github.ref == 'refs/heads/main'
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - name: Update kustomization image tags
+  #       run: |
+  #         SHA=$(echo "${{ github.sha }}" | cut -c1-7)
+  #         cd k8s
+  #         kustomize edit set image \
+  #           ghcr.io/trustsoftvn/deer-flow-backend:latest=ghcr.io/${{ env.ORG }}/deer-flow-backend:sha-${SHA} \
+  #           ghcr.io/trustsoftvn/deer-flow-frontend:latest=ghcr.io/${{ env.ORG }}/deer-flow-frontend:sha-${SHA}
+  #     - name: Commit and push
+  #       run: |
+  #         git config user.name "github-actions[bot]"
+  #         git config user.email "github-actions[bot]@users.noreply.github.com"
+  #         git add k8s/kustomization.yaml
+  #         git diff --staged --quiet || git commit -m "chore: update k8s image tags to sha-$(echo ${{ github.sha }} | cut -c1-7)"
+  #         git push
